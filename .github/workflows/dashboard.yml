@@ -1,0 +1,55 @@
+name: Dashboard as Code CI/CD
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'dashboards/**.json'
+  push:
+    branches:
+      - main
+    paths:
+      - 'dashboards/**.json'
+
+jobs:
+  deploy-dashboard:
+    # ローカルのセルフホストランナーで実行
+    runs-on: self-hosted
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Process and Deploy Dashboard
+        env:
+          GRAFANA_URL: "http://grafana:3000" # Dockerネットワーク内の名前解決
+          GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+        run: |
+          # 変更されたJSONファイルを特定（デモ用に簡略化。最初の1つを取得）
+          DASHBOARD_FILE=$(ls dashboards/*.json | head -n 1)
+          
+          if [ -z "$DASHBOARD_FILE" ]; then
+            echo "No dashboard file found."
+            exit 0
+          fi
+
+          # 1. 読み取り専用に設定 ("editable": false)
+          # 2. PRの場合はタイトルに [Review-PR#X] を付与して競合を防ぐ
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUM=${{ github.event.pull_request.number }}
+            NEW_TITLE=$(jq ".title = .title + \" [Review-PR#${PR_NUM}]\"" $DASHBOARD_FILE)
+            PAYLOAD=$(echo "$NEW_TITLE" | jq '.editable = false | {dashboard: ., overwrite: true}')
+          else
+            PAYLOAD=$(jq '.editable = false | {dashboard: ., overwrite: true}' $DASHBOARD_FILE)
+          fi
+
+          # Grafana API へポスト
+          curl -X POST \
+            -H "Authorization: Bearer $GRAFANA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            $GRAFANA_URL/api/dashboards/db
