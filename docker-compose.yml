@@ -22,15 +22,17 @@ services:
       - dac-network
 
   github-runner:
-    image: ghcr.io/actions/actions-runner:latest
-    container_name: dac-runner
-    environment:
-      - REPO_URL=${GITHUB_REPO_URL}
-      - RUNNER_TOKEN=${GITHUB_RUNNER_TOKEN}
-      - RUNNER_NAME=local-docker-runner
-    networks:
-      - dac-network
-    restart: always
+      image: myoung34/github-runner:latest
+      container_name: dac-runner
+      environment:
+        - REPO_URL=${GITHUB_REPO_URL}
+        - RUNNER_TOKEN=${GITHUB_RUNNER_TOKEN}
+        - RUNNER_NAME=local-docker-runner
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+      networks:
+        - dac-network
+      restart: always
 
 networks:
   dac-network:
