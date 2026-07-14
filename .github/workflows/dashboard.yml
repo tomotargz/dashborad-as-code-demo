@@ -39,17 +39,28 @@ jobs:
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             PR_NUM=${{ github.event.pull_request.number }}
-            # ★ここが重要: idをnull化, uidにPR番号を付与, タイトル変更, 読み取り専用化
-            NEW_DASHBOARD=$(jq ".title = .title + \" [Review-PR#${PR_NUM}]\" | .id = null | .uid = .uid + \"-pr${PR_NUM}\" | .editable = false" $DASHBOARD_FILE)
+            # PR用: titleに[Review-PR#X]を付与, uidに -pr{番号} を付与, 読み取り専用化
+            NEW_DASHBOARD=$(jq ".title = \"[Review-PR#${PR_NUM}] \" + .title | .id = null | .uid = .uid + \"-pr${PR_NUM}\" | .editable = false" $DASHBOARD_FILE)
             PAYLOAD=$(echo "$NEW_DASHBOARD" | jq '{dashboard: ., overwrite: true}')
           else
-            # mainブランチ用: idをnull化, 読み取り専用化 (元のuidを引き継いで本番を上書きする)
-            PAYLOAD=$(jq '.id = null | .editable = false | {dashboard: ., overwrite: true}' $DASHBOARD_FILE)
+            # 本番用(main): titleに[Prod]を付与, uidに -prod を付与, 読み取り専用化
+            NEW_DASHBOARD=$(jq ".title = \"[Prod] \" + .title | .id = null | .uid = .uid + \"-prod\" | .editable = false" $DASHBOARD_FILE)
+            PAYLOAD=$(echo "$NEW_DASHBOARD" | jq '{dashboard: ., overwrite: true}')
           fi
 
           # Grafana API へポスト
-          curl -X POST \
+          HTTP_STATUS=$(curl -sS -o api_response.txt -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $GRAFANA_API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
-            $GRAFANA_URL/api/dashboards/db
+            $GRAFANA_URL/api/dashboards/db)
+
+          # レスポンス内容をログに表示
+          echo "Grafana API Response:"
+          cat api_response.txt
+
+          # ステータスコードが200番台以外ならエラー
+          if [[ "$HTTP_STATUS" != 20* ]]; then
+            echo "::error::Grafana API request failed with status $HTTP_STATUS"
+            exit 1
+          fi           $GRAFANA_URL/api/dashboards/db
