@@ -2,7 +2,7 @@ name: Dashboard as Code CI/CD
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, closed]
     paths:
       - 'dashboards/**.json'
   push:
@@ -11,11 +11,14 @@ on:
     paths:
       - 'dashboards/**.json'
 
+permissions:
+  pull-requests: write
+
 jobs:
-  deploy-dashboard:
-    # ローカルのセルフホストランナーで実行
+  deploy-review:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
     runs-on: self-hosted
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -24,43 +27,154 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y jq curl
 
-      - name: Process and Deploy Dashboard
+      - name: Deploy review dashboard
+        id: deploy
         env:
-          GRAFANA_URL: "http://grafana:3000" # Dockerネットワーク内の名前解決
+          GRAFANA_URL: "http://grafana:3000"
+          GRAFANA_EXTERNAL_URL: ${{ secrets.GRAFANA_EXTERNAL_URL }}
           GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
         run: |
-          # 変更されたJSONファイルを特定
           DASHBOARD_FILE=$(ls dashboards/*.json | head -n 1)
-          
+
           if [ -z "$DASHBOARD_FILE" ]; then
             echo "No dashboard file found."
             exit 0
           fi
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_NUM=${{ github.event.pull_request.number }}
-            # PR用: titleに[Review-PR#X]を付与, uidに -pr{番号} を付与, 読み取り専用化
-            NEW_DASHBOARD=$(jq ".title = \"[Review-PR#${PR_NUM}] \" + .title | .id = null | .uid = .uid + \"-pr${PR_NUM}\" | .editable = false" $DASHBOARD_FILE)
-            PAYLOAD=$(echo "$NEW_DASHBOARD" | jq '{dashboard: ., overwrite: true}')
-          else
-            # 本番用(main): titleに[Prod]を付与, uidに -prod を付与, 読み取り専用化
-            NEW_DASHBOARD=$(jq ".title = \"[Prod] \" + .title | .id = null | .uid = .uid + \"-prod\" | .editable = false" $DASHBOARD_FILE)
-            PAYLOAD=$(echo "$NEW_DASHBOARD" | jq '{dashboard: ., overwrite: true}')
-          fi
+          PR_NUM=${{ github.event.pull_request.number }}
 
-          # Grafana API へポスト
+          # v2形式のJSONからtitle, uid, editableを変更
+          NEW_DASHBOARD=$(jq "
+            .spec.title = \"[Review-PR#${PR_NUM}] \" + .spec.title |
+            .metadata.uid = .metadata.uid + \"-pr${PR_NUM}\" |
+            .metadata.name = null |
+            .spec.editable = false
+          " "$DASHBOARD_FILE")
+
+          PAYLOAD=$(echo "$NEW_DASHBOARD" | jq '{dashboard: ., overwrite: true}')
+
           HTTP_STATUS=$(curl -sS -o api_response.txt -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $GRAFANA_API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
-            $GRAFANA_URL/api/dashboards/db)
+            "$GRAFANA_URL/api/dashboards/db")
 
-          # レスポンス内容をログに表示
           echo "Grafana API Response:"
           cat api_response.txt
 
-          # ステータスコードが200番台以外ならエラー
           if [[ "$HTTP_STATUS" != 20* ]]; then
             echo "::error::Grafana API request failed with status $HTTP_STATUS"
             exit 1
-          fi           $GRAFANA_URL/api/dashboards/db
+          fi
+
+          # レスポンスからダッシュボードURLを取得
+          DASHBOARD_PATH=$(jq -r '.url' api_response.txt)
+          if [ -n "$GRAFANA_EXTERNAL_URL" ]; then
+            REVIEW_URL="${GRAFANA_EXTERNAL_URL}${DASHBOARD_PATH}"
+          else
+            REVIEW_URL="${GRAFANA_URL}${DASHBOARD_PATH}"
+          fi
+          echo "REVIEW_URL=$REVIEW_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Comment review dashboard URL on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          REVIEW_URL: ${{ steps.deploy.outputs.REVIEW_URL }}
+        run: |
+          gh pr comment "$PR_NUM" --body "### レビュー用ダッシュボード
+
+          レビュー用ダッシュボードがデプロイされました。
+
+          URL: ${REVIEW_URL}"
+
+  cleanup-review:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Delete review dashboard
+        env:
+          GRAFANA_URL: "http://grafana:3000"
+          GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+        run: |
+          DASHBOARD_FILE=$(ls dashboards/*.json | head -n 1)
+
+          if [ -z "$DASHBOARD_FILE" ]; then
+            echo "No dashboard file found."
+            exit 0
+          fi
+
+          PR_NUM=${{ github.event.pull_request.number }}
+          ORIGINAL_UID=$(jq -r '.metadata.uid' "$DASHBOARD_FILE")
+          REVIEW_UID="${ORIGINAL_UID}-pr${PR_NUM}"
+
+          echo "Deleting review dashboard with UID: $REVIEW_UID"
+
+          HTTP_STATUS=$(curl -sS -o api_response.txt -w "%{http_code}" -X DELETE \
+            -H "Authorization: Bearer $GRAFANA_API_KEY" \
+            "$GRAFANA_URL/api/dashboards/uid/$REVIEW_UID")
+
+          echo "Grafana API Response:"
+          cat api_response.txt
+
+          if [[ "$HTTP_STATUS" != 20* ]]; then
+            echo "::warning::Failed to delete review dashboard (status $HTTP_STATUS). It may have been already deleted."
+          else
+            echo "Review dashboard deleted successfully."
+          fi
+
+  deploy-prod:
+    if: github.event_name == 'push'
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Deploy production dashboard
+        env:
+          GRAFANA_URL: "http://grafana:3000"
+          GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+        run: |
+          DASHBOARD_FILE=$(ls dashboards/*.json | head -n 1)
+
+          if [ -z "$DASHBOARD_FILE" ]; then
+            echo "No dashboard file found."
+            exit 0
+          fi
+
+          # v2形式のJSONからtitle, uid, editableを変更
+          NEW_DASHBOARD=$(jq '
+            .spec.title = "[Prod] " + .spec.title |
+            .metadata.uid = .metadata.uid + "-prod" |
+            .metadata.name = null |
+            .spec.editable = false
+          ' "$DASHBOARD_FILE")
+
+          PAYLOAD=$(echo "$NEW_DASHBOARD" | jq '{dashboard: ., overwrite: true}')
+
+          HTTP_STATUS=$(curl -sS -o api_response.txt -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $GRAFANA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$GRAFANA_URL/api/dashboards/db")
+
+          echo "Grafana API Response:"
+          cat api_response.txt
+
+          if [[ "$HTTP_STATUS" != 20* ]]; then
+            echo "::error::Grafana API request failed with status $HTTP_STATUS"
+            exit 1
+          fi
